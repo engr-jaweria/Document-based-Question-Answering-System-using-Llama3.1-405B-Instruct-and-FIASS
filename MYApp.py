@@ -1,161 +1,130 @@
 import os
-import json
 import numpy as np
-import faiss
 import streamlit as st
-from dotenv import load_dotenv
-from langchain.document_loaders import PyPDFLoader, TextLoader
-from tempfile import NamedTemporaryFile
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.embeddings import HuggingFaceEmbeddings
+from langchain.prompts import PromptTemplate
+from langchain.llms import HuggingFaceHub
 from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForCausalLM, AutoTokenizer
-from tenacity import retry, stop_after_attempt, wait_exponential
+import faiss
+import pickle
+from langchain.vectorstores import FAISS
+from langchain.document_loaders import TextLoader, PDFMinerLoader
+from langchain.text_splitter import CharacterTextSplitter
+from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
-# Set environment variables
-HF_TOKEN = os.getenv("HF_TOKEN")
-if not HF_TOKEN:
-    raise ValueError("Hugging Face API Token is not set in environment variables.")
+# FAISS Index and metadata loading and saving
+def load_faiss_index(index_path):
+    return faiss.read_index(index_path)
 
-# Initialize Llama 3.1 (Hugging Face Model)
-model_name = "meta-llama/Llama-3.1-405B-Instruct"
-model = AutoModelForCausalLM.from_pretrained(model_name, use_auth_token=HF_TOKEN)
-tokenizer = AutoTokenizer.from_pretrained(model_name, use_auth_token=HF_TOKEN)
+def load_metadata(metadata_path):
+    with open(metadata_path, "rb") as f:
+        return pickle.load(f)
 
-# Initialize Sentence Transformer Model for embeddings
-embedding_model = SentenceTransformer('all-MiniLM-L6-v2')  # You can use another model here
+def save_faiss_index(index, index_path):
+    faiss.write_index(index, index_path)
 
-# Token estimation function
-def estimate_tokens(text):
-    words = text.split()
-    return int(len(words) / 0.75)  # Rough token estimate per document
+def save_metadata(metadata, metadata_path):
+    with open(metadata_path, "wb") as f:
+        pickle.dump(metadata, f)
 
-# Process Uploaded Files
-def process_uploaded_files(uploaded_files):
-    """Process and load documents from uploaded files."""
-    document_list = []
+def update_index_with_new_files(uploaded_files, faiss_index_path, metadata_path, embeddings):
+    documents = []
+    metadata = []
     for uploaded_file in uploaded_files:
-        # Save the uploaded file to a temporary file
-        file_extension = os.path.splitext(uploaded_file.name)[1].lower()
-
-        with NamedTemporaryFile(delete=False, suffix=file_extension) as tmp_file:
-            tmp_file.write(uploaded_file.getvalue())
-            temp_file_path = tmp_file.name
-
-        # Choose loader based on file type
-        if file_extension == ".pdf":
-            loader = PyPDFLoader(temp_file_path)
-        elif file_extension == ".txt":
-            loader = TextLoader(temp_file_path, encoding="utf-8")  # Use UTF-8 encoding for text files
+        if uploaded_file.type == "application/pdf":
+            loader = PDFMinerLoader(uploaded_file)
+        elif uploaded_file.type == "text/plain":
+            loader = TextLoader(uploaded_file)
         else:
-            st.warning(f"Unsupported file format: {file_extension}. Skipping {uploaded_file.name}")
+            st.error("Unsupported file format!")
             continue
+        document = loader.load()
+        text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        docs = text_splitter.split_documents(document)
+        documents.extend(docs)
+        metadata.extend([{"content": doc.page_content} for doc in docs])
+    
+    if documents:
+        # Create embeddings for the documents
+        doc_embeddings = embeddings.embed_documents([doc.page_content for doc in documents])
+        # Create a FAISS index
+        index = faiss.IndexFlatL2(len(doc_embeddings[0]))
+        faiss.normalize_L2(doc_embeddings)
+        index.add(np.array(doc_embeddings).astype('float32'))
+        save_faiss_index(index, faiss_index_path)
+        save_metadata(metadata, metadata_path)
+        return index, metadata
+    else:
+        return None, None
 
-        # Load documents and extend the document list
-        try:
-            documents = loader.load()
-            document_list.extend(documents)
-        except Exception as e:
-            st.error(f"Error loading {uploaded_file.name}: {e}")
-            continue
+# Summarize Long Context to Fit Token Limit
+def summarize_long_context(retrieved_docs, model, max_context_tokens=2000):
+    """Summarize documents to fit within the token limit."""
+    summaries = []
+    prompt = PromptTemplate(
+        input_variables=["content"],
+        template="""Summarize the following document to capture the key points in 200 words or less:
 
-        # Optionally clean up the temporary file after processing
-        os.remove(temp_file_path)
+        {content}
 
-    return document_list
+        Summary:"""
+    )
+    for doc in retrieved_docs:
+        context = prompt.format(content=doc['content'])
+        summaries.append(model(context))
+    return "\n".join(summaries)
 
-# Split Documents into Chunks
-def split_docs(documents, chunk_size=1000, chunk_overlap=20, max_tokens=2000):
-    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    chunks = text_splitter.split_documents(documents)
+# Perform Retrieval and Generate Answer
+def search_similar_docs_with_faiss_and_generate_answer(query, index, metadata, embeddings, model, k=3, max_context_tokens=2000):
+    """Retrieve and synthesize information from multiple documents, prioritizing by relevance score."""
+    query_embedding = embeddings.embed_query(query)
+    query_embedding = np.array(query_embedding).astype('float32').reshape(1, -1)
 
-    # Ensure chunks do not exceed token limit
-    valid_chunks = []
-    for chunk in chunks:
-        token_count = estimate_tokens(chunk.page_content)
-        if token_count <= max_tokens:
-            valid_chunks.append(chunk)
-        else:
-            st.warning(f"Skipping chunk due to token limit: {chunk.page_content[:100]}... (tokens: {token_count})")
-
-    return valid_chunks
-
-# Generate embeddings for documents using Sentence Transformers
-def generate_embeddings(documents):
-    embeddings = embedding_model.encode([doc.page_content for doc in documents], convert_to_tensor=True)
-    return embeddings.cpu().detach().numpy()
-
-# Create FAISS index from documents
-def create_faiss_index(embeddings):
-    dimension = embeddings.shape[1]  # Embedding dimension
-    index = faiss.IndexFlatL2(dimension)  # Using L2 distance (Euclidean)
-    index.add(embeddings)
-    return index
-
-# Generate Answer with Llama 3.1
-def generate_answer_with_llama(query, retrieved_docs):
-    context = "\n---\n".join([f"Document {i+1}:\n{doc['content']}" for i, doc in enumerate(retrieved_docs)])
-
-    # Tokenize input for Llama
-    inputs = tokenizer.encode(query + context, return_tensors="pt", truncation=True, padding=True, max_length=1024)
-    outputs = model.generate(inputs, max_length=150, num_return_sequences=1, no_repeat_ngram_size=3)
-
-    # Decode the generated response
-    answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return answer
-
-# Create or update FAISS index with new documents
-def update_index_with_new_files(uploaded_files, faiss_index_path, metadata_path):
-    if uploaded_files:
-        # Process newly uploaded documents
-        new_docs = process_uploaded_files(uploaded_files)
-        new_docs = split_docs(new_docs, chunk_size=1000, chunk_overlap=20, max_tokens=2000)
-
-        if new_docs:
-            # Generate embeddings for new documents
-            new_embeddings = generate_embeddings(new_docs)
-
-            # Create or update FAISS index
-            index = create_faiss_index(new_embeddings)
-
-            # Load existing metadata if it exists
-            if os.path.exists(metadata_path):
-                with open(metadata_path, 'r') as f:
-                    existing_metadata = json.load(f)
-            else:
-                existing_metadata = []
-
-            # Update metadata with new documents
-            metadata = [{'doc_id': len(existing_metadata) + i, 'content': doc.page_content}
-                        for i, doc in enumerate(new_docs)]
-            existing_metadata.extend(metadata)
-
-            # Save updated FAISS index and metadata
-            faiss.write_index(index, faiss_index_path)
-            with open(metadata_path, 'w') as f:
-                json.dump(existing_metadata, f)
-
-            return index, existing_metadata
-    return None, None
-
-# Perform FAISS search and generate an answer
-def search_similar_docs_with_faiss_and_generate_answer(query, faiss_index, metadata, embeddings, k=3, max_context_tokens=2000):
-    query_embedding = embedding_model.encode([query], convert_to_tensor=True).cpu().detach().numpy()
-    distances, indices = faiss_index.search(query_embedding, k)
+    # Perform FAISS search
+    distances, indices = index.search(query_embedding, k)
 
     if indices[0].size > 0 and np.any(indices[0] != -1):  # Ensure valid retrieval
-        retrieved_docs = [(metadata[idx], score) for idx, score in zip(indices[0], distances[0])]
+        # Pair retrieved document indices with their relevance scores (distances)
+        retrieved_docs = []
+        for idx, score in zip(indices[0], distances[0]):
+            if idx != -1:
+                retrieved_docs.append((metadata[idx], score))
+
+        # Deduplicate the retrieved documents
+        unique_docs = {doc['content']: (doc, score) for doc, score in retrieved_docs}.values()
+        retrieved_docs = list(unique_docs)
 
         # Sort documents by relevance (ascending distance means higher relevance)
         retrieved_docs.sort(key=lambda x: x[1])
 
-        # Generate answer with Llama using retrieved documents as context
-        answer = generate_answer_with_llama(query, [doc for doc, _ in retrieved_docs])
+        st.write(f"Retrieved {len(retrieved_docs)} document(s) for the query, sorted by relevance:")
+        for i, (doc, score) in enumerate(retrieved_docs):  # Display snippets and scores
+            st.write(f"Document {i + 1} | Score: {score:.4f} | Snippet: {doc['content'][:200]}...")
+
+        # Concatenate the most relevant context for the LLM
+        context = "\n---\n".join(
+            [f"Document {i + 1} (Score: {score:.4f}):\n{doc['content']}" for i, (doc, score) in enumerate(retrieved_docs)]
+        )
+
+        # Summarize context if it exceeds token limit
+        if len(context.split()) > max_context_tokens:
+            st.write("Context too large; summarizing the top documents...")
+            context = summarize_long_context([doc for doc, _ in retrieved_docs], model, max_context_tokens)
+
+        if not context.strip():
+            st.write("No sufficient context retrieved to answer the query.")
+            return "I cannot determine this from the provided information."
+
+        # Generate the answer
+        answer = model(context)
+        st.write(f"### Generated Answer: {answer}")
         return answer
     else:
-        return "No relevant documents found for the query."
+        st.write("No relevant documents found for the query.")
+        return "I cannot determine this from the provided information."
 
 # Main Streamlit Interface
 def main():
@@ -168,32 +137,38 @@ def main():
         accept_multiple_files=True,
     )
 
-    # FAISS index and metadata paths
+    # FAISS index and metadata paths (hidden)
     faiss_index_path = "faiss_index.index"
-    metadata_path = "metadata.json"
+    metadata_path = "metadata.pkl"
+
+    # Initialize Llama 3.1 8B model
+    model = HuggingFaceHub(repo_id="meta-llama/Llama-3.1-8B", token=os.getenv('HF_ACCESS_TOKEN'))
+
+    embeddings = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
     # Check if FAISS index exists and load or create
     if os.path.exists(faiss_index_path) and os.path.exists(metadata_path):
-        with open(metadata_path, 'r') as f:
-            metadata = json.load(f)
-        faiss_index = faiss.read_index(faiss_index_path)
+        st.write("FAISS index exists. Loading FAISS index...")
+        metadata = load_metadata(metadata_path)
+        index = load_faiss_index(faiss_index_path)
     else:
-        faiss_index = None
-        metadata = None
+        st.write("No FAISS index found. Please upload documents to create the index.")
+        metadata, index = None, None
 
     # Update FAISS index and metadata if new files are uploaded
-    new_index, new_metadata = update_index_with_new_files(uploaded_files, faiss_index_path, metadata_path)
+    new_index, new_metadata = update_index_with_new_files(
+        uploaded_files, faiss_index_path, metadata_path, embeddings
+    )
     if new_index and new_metadata:
-        faiss_index = new_index
+        index = new_index
         metadata = new_metadata
 
     # Query System
     query = st.text_input("Enter your question:")
 
     if query:
-        if faiss_index and metadata:
-            answer = search_similar_docs_with_faiss_and_generate_answer(query, faiss_index, metadata, embedding_model)
-            st.write(f"### Generated Answer: {answer}")
+        if index and metadata:
+            search_similar_docs_with_faiss_and_generate_answer(query, index, metadata, embeddings, model)
         else:
             st.write("No documents available for querying. Please upload files.")
 
