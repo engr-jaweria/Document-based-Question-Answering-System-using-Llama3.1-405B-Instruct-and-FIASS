@@ -1,0 +1,13 @@
+streamlit
+sentence-transformers
+langchain
+langchain-community
+faiss-cpu
+pymupdf
+python-docx
+python-pptx
+pandas
+openpyxl
+requests
+numpy
+pyngrok
