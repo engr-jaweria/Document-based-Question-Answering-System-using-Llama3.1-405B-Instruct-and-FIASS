@@ -1,154 +1,167 @@
 import os
-import tempfile
-import numpy as np
+import json
 import faiss
-import requests
-import pandas as pd
+import numpy as np
+from tempfile import NamedTemporaryFile
 from sentence_transformers import SentenceTransformer
 from langchain.prompts import PromptTemplate
-from langchain.chains import RetrievalQA
-from langchain_community.vectorstores import FAISS
-from langchain.embeddings import HuggingFaceEmbeddings
-import streamlit as st
-import fitz  # PyMuPDF for PDF handling
-from docx import Document as DocxDocument
-from pptx import Presentation
-from dotenv import load_dotenv
+from langchain.chains import LLMChain
+from langchain.text_splitter import RecursiveCharacterTextSplitter
 from langchain.schema import Document
-from langchain.docstore import InMemoryDocstore
-from langchain.vectorstores import FAISS as LangchainFAISS
-from langchain.docstore.document import Document as LangchainDocument
+import streamlit as st
+from retrying import retry
 
-# Load environment variables
-load_dotenv()
-
-# Set environment variables
-REPLICATE_API_TOKEN = os.getenv("REPLICATE_API_TOKEN")
-HUGGINGFACE_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
-if not REPLICATE_API_TOKEN or not HUGGINGFACE_API_TOKEN:
-    raise ValueError("API tokens for Replicate and Hugging Face are not set in environment variables.")
-
-# Initialize models
-EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
-embeddings_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
-
-# Define utility functions
-def extract_text_from_file(uploaded_file):
-    """Extract text from uploaded files based on file type."""
-    file_extension = uploaded_file.name.split(".")[-1].lower()
-    if file_extension == "pdf":
-        return extract_text_from_pdf(uploaded_file)
-    elif file_extension == "docx":
-        return extract_text_from_docx(uploaded_file)
-    elif file_extension == "pptx":
-        return extract_text_from_pptx(uploaded_file)
-    elif file_extension in ["xls", "xlsx"]:
-        return extract_text_from_xlsx(uploaded_file)
-    else:
-        return None
+def estimate_tokens(text):
+    words = text.split()
+    return int(len(words) / 0.75)  # Rough token estimate per document
 
 def extract_text_from_pdf(pdf_file):
     """Extract text from a PDF file."""
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
-        tmp_file.write(pdf_file.read())
-        tmp_file_path = tmp_file.name
-
+    import fitz  # PyMuPDF
     text = ""
+    with fitz.open(pdf_file) as doc:
+        for page in doc:
+            text += page.get_text()
+    return text
+
+def extract_text_from_txt(txt_file):
+    """Extract text from a TXT file."""
+    return txt_file.read().decode('utf-8')
+
+def process_uploaded_files(uploaded_files):
+    document_list = []
+    for uploaded_file in uploaded_files:
+        file_extension = os.path.splitext(uploaded_file.name)[1].lower()
+        if file_extension == ".pdf":
+            text = extract_text_from_pdf(uploaded_file)
+        elif file_extension == ".txt":
+            text = extract_text_from_txt(uploaded_file)
+        else:
+            st.warning(f"Unsupported file format: {file_extension}. Skipping {uploaded_file.name}")
+            continue
+
+        document_list.append(Document(page_content=text))
+    return document_list
+
+def split_docs(documents, chunk_size=1000, chunk_overlap=20, max_tokens=2000):
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    chunks = text_splitter.split_documents(documents)
+
+    valid_chunks = []
+    for chunk in chunks:
+        token_count = estimate_tokens(chunk.page_content)
+        if token_count <= max_tokens:
+            valid_chunks.append(chunk)
+        else:
+            st.warning(f"Skipping chunk due to token limit: {chunk.page_content[:100]}...")
+
+    return valid_chunks
+
+@retry(stop_max_attempt_number=5, wait_exponential_multiplier=1000)
+def embed_documents_with_retry(texts, embeddings):
+    return embeddings.encode(texts, show_progress_bar=True)
+
+def create_faiss_vectorstore_from_docs(docs, embeddings, faiss_index_path, metadata_path):
+    texts = [doc.page_content for doc in docs]
+    embeddings_matrix = embed_documents_with_retry(texts, embeddings)
+
+    embeddings_array = np.array(embeddings_matrix).astype('float32')
+    dimension = embeddings_array.shape[1]
+    index = faiss.IndexFlatL2(dimension)
+    index.add(embeddings_array)
+
+    if os.path.exists(faiss_index_path):
+        os.remove(faiss_index_path)
+    faiss.write_index(index, faiss_index_path)
+
+    metadata = [{'doc_id': i, 'content': doc.page_content} for i, doc in enumerate(docs)]
+    with open(metadata_path, 'w') as f:
+        json.dump(metadata, f)
+
+    return index
+
+def load_faiss_index(faiss_index_path):
     try:
-        with fitz.open(tmp_file_path) as doc:
-            for page in doc:
-                text += page.get_text()
-    finally:
-        os.unlink(tmp_file_path)  # Clean up the temporary file
-    return text
+        return faiss.read_index(faiss_index_path)
+    except Exception as e:
+        st.error(f"Error loading FAISS index: {e}")
+        return None
 
-def extract_text_from_docx(docx_file):
-    """Extract text from a DOCX file."""
-    doc = DocxDocument(docx_file)
-    return "\n".join([para.text for para in doc.paragraphs])
+def load_metadata(metadata_path):
+    try:
+        with open(metadata_path, 'r') as f:
+            return json.load(f)
+    except Exception as e:
+        st.error(f"Error loading metadata: {e}")
+        return []
 
-def extract_text_from_pptx(pptx_file):
-    """Extract text from a PPTX file."""
-    presentation = Presentation(pptx_file)
-    text = ""
-    for slide in presentation.slides:
-        for shape in slide.shapes:
-            if shape.has_text_frame:
-                text += shape.text + "\n"
-    return text
+def generate_answer_with_llm(query, retrieved_docs, model):
+    context = "\n---\n".join([f"Document {i+1}:\n{doc['content']}" for i, doc in enumerate(retrieved_docs)])
+    prompt = PromptTemplate(
+        input_variables=["question", "context"],
+        template="""
+            You are a helpful assistant. Use the context below to answer the question. If the answer cannot be found, say so.
 
-def extract_text_from_xlsx(xlsx_file):
-    """Extract text from an XLSX file."""
-    df = pd.read_excel(xlsx_file)
-    return df.to_string()
+            Context:
+            {context}
 
-def llama3_1_generate(prompt, model="meta-llama/Llama-3.1-405B-Instruct", top_p=0.9, temperature=0.7, max_tokens=800):
-    """Generate text using Llama 3.1."""
-    input = {
-        "top_p": top_p,
-        "prompt": prompt,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
-    }
-    # Replace this mock with actual API call or inference logic for Llama 3.1
-    return f"Generated response: {prompt}"
+            Question:
+            {question}
 
-# Main Streamlit application
+            Answer:
+        """
+    )
+    llm_chain = LLMChain(prompt=prompt, llm=model)
+    return llm_chain.run({"question": query, "context": context})
+
+def search_similar_docs_with_faiss_and_generate_answer(query, index, metadata, embeddings, model, k=3, max_context_tokens=2000):
+    query_embedding = embeddings.encode([query], show_progress_bar=False)[0]
+    query_embedding = np.array(query_embedding).astype('float32').reshape(1, -1)
+
+    distances, indices = index.search(query_embedding, k)
+
+    if indices[0].size > 0 and np.any(indices[0] != -1):
+        retrieved_docs = [metadata[idx] for idx in indices[0] if idx != -1]
+        context = "\n---\n".join([doc['content'] for doc in retrieved_docs])
+
+        if len(context.split()) > max_context_tokens:
+            st.warning("Context too large; summarizing...")
+            context = "\n---\n".join(retrieved_docs[:max_context_tokens])
+
+        return generate_answer_with_llm(query, retrieved_docs, model)
+
+    return "No relevant documents found."
+
 def main():
-    st.title("Document-Based Question Answering System")
+    st.title("Document-based Question Answering System")
 
-    # Upload documents
-    uploaded_file = st.file_uploader("Upload your document (PDF, DOCX, PPTX, XLSX)", type=["pdf", "docx", "pptx", "xlsx"])
+    uploaded_files = st.file_uploader("Upload your documents (.pdf or .txt):", type=["pdf", "txt"], accept_multiple_files=True)
 
-    # Ensure context is initialized
-    context = ""
-    if uploaded_file:
-        context = extract_text_from_file(uploaded_file)
-        if not context:
-            st.error("Unsupported file type. Please upload a PDF, DOCX, PPTX, or XLSX file.")
-            return
+    faiss_index_path = "faiss_index.index"
+    metadata_path = "metadata.json"
+
+    embedding_model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+
+    if uploaded_files:
+        docs = process_uploaded_files(uploaded_files)
+        chunks = split_docs(docs)
+
+        if chunks:
+            index = create_faiss_vectorstore_from_docs(chunks, embedding_model, faiss_index_path, metadata_path)
+        else:
+            index, metadata = None, None
     else:
-        context = "No document uploaded. Please upload a document to provide context."
+        index = load_faiss_index(faiss_index_path)
+        metadata = load_metadata(metadata_path)
 
-    # Initialize chat history if not already done
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+    query = st.text_input("Enter your question:")
 
-    # Question input
-    question = st.text_input("Enter your question:")
-    format_choice = st.radio("Select the format of the answer:", ["Bullet Points", "Summary", "Specific Length"])
-    word_limit = st.number_input("Word limit (if applicable):", min_value=1, value=50) if format_choice == "Specific Length" else None
-
-    if st.button("Get Answer") and question:
-        # Prepare chat history for prompt
-        history_context = " ".join(
-            [f"Q: {entry['question']} A: {entry['answer']}" for entry in st.session_state.chat_history]
-        )
-
-        # Build the prompt
-        prompt = f"Context: {context}\n\nChat History: {history_context}\n\nQuestion: {question}"
-
-        # Format prompt based on user choice
-        if format_choice == "Bullet Points":
-            prompt += "\nPlease provide the answer as bullet points."
-        elif format_choice == "Summary":
-            prompt += "\nPlease summarize concisely."
-        elif format_choice == "Specific Length":
-            prompt += f"\nLimit the answer to {word_limit} words."
-
-        # Generate the answer
-        answer = llama3_1_generate(prompt)
-
-        # Save chat history and display answer
-        st.session_state.chat_history.append({"question": question, "answer": answer})
-        st.markdown(f"**Q: {question}**")
-        st.markdown(f"**A:** {answer}")
-
-    # Display full chat history
-    if st.session_state.chat_history:
-        st.header("Chat History")
-        for entry in st.session_state.chat_history:
-            st.write(f"**Q:** {entry['question']}\n**A:** {entry['answer']}\n")
+    if query:
+        if index and metadata:
+            answer = search_similar_docs_with_faiss_and_generate_answer(query, index, metadata, embedding_model, model="meta-llama/Llama-3.1-405B-Instruct")
+            st.write(f"Answer: {answer}")
+        else:
+            st.warning("No documents available for querying. Please upload files.")
 
 if __name__ == "__main__":
     main()
