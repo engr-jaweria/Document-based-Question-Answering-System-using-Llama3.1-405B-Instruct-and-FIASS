@@ -61,16 +61,16 @@ def extract_text_from_xlsx(xlsx_file):
     df = pd.read_excel(xlsx_file)
     return df.to_string()
 
-def llama3_generate(prompt, top_p=1, temperature=0.75, max_new_tokens=800):
+def llama3_1_generate(prompt, model="meta-llama/Llama-3.1-405B-Instruct", top_p=0.9, temperature=0.7, max_tokens=800):
     """Generate text using Llama 3.1."""
     input = {
         "top_p": top_p,
         "prompt": prompt,
         "temperature": temperature,
-        "max_new_tokens": max_new_tokens
+        "max_tokens": max_tokens,
     }
-    # Mocked response for simplicity
-    return f"Generated response based on: {prompt}"
+    # Replace this mock with actual API call or inference logic for Llama 3.1
+    return f"Generated response: {prompt}"
 
 # Main Streamlit application
 def main():
@@ -136,27 +136,35 @@ def main():
         st.header("Ask a Question")
         question = st.text_input("Your Question:")
 
+        # Chat interface with better context handling
         if st.button("Get Answer") and question:
-            # Handle follow-up questions
-            chat_context = "\n".join([f"Q: {entry['question']}\nA: {entry['answer']}" for entry in st.session_state.chat_history])
-            context_docs = retriever.get_relevant_documents(question)
-            context = "\n".join([doc.page_content for doc in context_docs])
-            prompt = f"Previous context:\n{chat_context}\n\nDocuments context:\n{context}\n\nQuestion: {question}\nProvide a concise and accurate answer."
-
-            answer = llama3_generate(prompt)
-
-            # Save chat history
+            # Integrate chat history into the query
+            history_context = " ".join(
+                [f"Q: {entry['question']} A: {entry['answer']}" for entry in st.session_state.chat_history]
+            )
+            prompt = f"Context: {context}\n\nChat History: {history_context}\n\nQuestion: {question}"
+            
+            # Format prompt based on user input
+            if format_choice == "Bullet Points":
+                prompt += "\nPlease provide the answer as bullet points."
+            elif format_choice == "Summary":
+                prompt += "\nPlease summarize concisely."
+            elif format_choice == "Specific Length":
+                prompt += f"\nLimit the answer to {word_limit} words."
+        
+            # Generate response using Llama 3.1
+            answer = llama3_1_generate(prompt)
+        
+            # Save chat history and display answer
             st.session_state.chat_history.append({"question": question, "answer": answer})
-
-            # Display formatted question and answer
-            st.markdown(f"## **{answer}**")  # Answer in large, bold (Heading 1)
-            st.markdown(f"### **{question}**")  # Question in large, bold (Heading 3)
-
-        # Display chat history
-        if st.session_state.chat_history:
+            st.markdown(f"### **Q: {question}**")
+            st.markdown(f"#### **A:** {answer}")
+        
+            # Show full chat history
             st.header("Chat History")
             for entry in st.session_state.chat_history:
                 st.write(f"**Q:** {entry['question']}\n**A:** {entry['answer']}\n")
+
 
     else:
         st.write("Upload documents to begin.")
