@@ -11,3 +11,4 @@ openpyxl
 requests
 numpy
 pyngrok
+tenacity
