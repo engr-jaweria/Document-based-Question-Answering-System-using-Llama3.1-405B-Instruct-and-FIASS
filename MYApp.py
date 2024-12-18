@@ -128,7 +128,7 @@ def search_similar_docs_with_faiss_and_generate_answer(query, index, metadata, e
 
 # Main Streamlit Interface
 def main():
-    st.title("Document-based Question Answering System")
+    st.title("🦙 Document-based Question Answering System")
 
     # Upload Documents
     uploaded_files = st.file_uploader(
@@ -163,14 +163,39 @@ def main():
         index = new_index
         metadata = new_metadata
 
-    # Query System
-    query = st.text_input("Enter your question:")
+    # Display chat interface for user interaction
+    st.set_page_config(
+        page_title="Chat with Doc",
+        page_icon="📄",
+        layout="centered"
+    )
 
-    if query:
-        if index and metadata:
-            search_similar_docs_with_faiss_and_generate_answer(query, index, metadata, embeddings, model)
-        else:
-            st.write("No documents available for querying. Please upload files.")
+    st.title("🦙 Chat with Doc - LLAMA 3.1")
+
+    # Initialize chat history in Streamlit session state
+    if "chat_history" not in st.session_state:
+        st.session_state.chat_history = []
+
+    # Display chat history
+    for message in st.session_state.chat_history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    # User input for asking questions
+    user_input = st.chat_input("Ask Llama...")
+
+    if user_input:
+        st.session_state.chat_history.append({"role": "user", "content": user_input})
+
+        with st.chat_message("user"):
+            st.markdown(user_input)
+
+        with st.chat_message("assistant"):
+            if query:
+                search_similar_docs_with_faiss_and_generate_answer(user_input, index, metadata, embeddings, model)
+                assistant_response = "Answer based on your query"
+            st.markdown(assistant_response)
+            st.session_state.chat_history.append({"role": "assistant", "content": assistant_response})
 
 if __name__ == "__main__":
     main()
