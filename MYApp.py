@@ -49,10 +49,17 @@ def extract_text_from_file(uploaded_file):
 
 def extract_text_from_pdf(pdf_file):
     """Extract text from a PDF file."""
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp_file:
+        tmp_file.write(pdf_file.read())
+        tmp_file_path = tmp_file.name
+
     text = ""
-    with fitz.open(pdf_file) as doc:
-        for page in doc:
-            text += page.get_text()
+    try:
+        with fitz.open(tmp_file_path) as doc:
+            for page in doc:
+                text += page.get_text()
+    finally:
+        os.unlink(tmp_file_path)  # Clean up the temporary file
     return text
 
 def extract_text_from_docx(docx_file):
