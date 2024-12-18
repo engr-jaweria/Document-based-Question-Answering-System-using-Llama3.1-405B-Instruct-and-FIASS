@@ -33,6 +33,20 @@ EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 embeddings_model = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
 # Define utility functions
+def extract_text_from_file(uploaded_file):
+    """Extract text from uploaded files based on file type."""
+    file_extension = uploaded_file.name.split(".")[-1].lower()
+    if file_extension == "pdf":
+        return extract_text_from_pdf(uploaded_file)
+    elif file_extension == "docx":
+        return extract_text_from_docx(uploaded_file)
+    elif file_extension == "pptx":
+        return extract_text_from_pptx(uploaded_file)
+    elif file_extension in ["xls", "xlsx"]:
+        return extract_text_from_xlsx(uploaded_file)
+    else:
+        return None
+
 def extract_text_from_pdf(pdf_file):
     """Extract text from a PDF file."""
     text = ""
@@ -74,9 +88,20 @@ def llama3_1_generate(prompt, model="meta-llama/Llama-3.1-405B-Instruct", top_p=
 
 # Main Streamlit application
 def main():
+    st.title("Document-Based Question Answering System")
+
+    # Upload documents
+    uploaded_file = st.file_uploader("Upload your document (PDF, DOCX, PPTX, XLSX)", type=["pdf", "docx", "pptx", "xlsx"])
+
     # Ensure context is initialized
-    context = "Default context if no document is selected"  # Replace with appropriate logic
-    history_context = ""
+    context = ""
+    if uploaded_file:
+        context = extract_text_from_file(uploaded_file)
+        if not context:
+            st.error("Unsupported file type. Please upload a PDF, DOCX, PPTX, or XLSX file.")
+            return
+    else:
+        context = "No document uploaded. Please upload a document to provide context."
 
     # Initialize chat history if not already done
     if "chat_history" not in st.session_state:
@@ -88,11 +113,10 @@ def main():
     word_limit = st.number_input("Word limit (if applicable):", min_value=1, value=50) if format_choice == "Specific Length" else None
 
     if st.button("Get Answer") and question:
-        # Populate history context if chat history exists
-        if st.session_state.chat_history:
-            history_context = " ".join(
-                [f"Q: {entry['question']} A: {entry['answer']}" for entry in st.session_state.chat_history]
-            )
+        # Prepare chat history for prompt
+        history_context = " ".join(
+            [f"Q: {entry['question']} A: {entry['answer']}" for entry in st.session_state.chat_history]
+        )
 
         # Build the prompt
         prompt = f"Context: {context}\n\nChat History: {history_context}\n\nQuestion: {question}"
@@ -110,19 +134,14 @@ def main():
 
         # Save chat history and display answer
         st.session_state.chat_history.append({"question": question, "answer": answer})
-        st.markdown(f"### **Q: {question}**")
-        st.markdown(f"#### **A:** {answer}")
+        st.markdown(f"**Q: {question}**")
+        st.markdown(f"**A:** {answer}")
 
     # Display full chat history
     if st.session_state.chat_history:
         st.header("Chat History")
         for entry in st.session_state.chat_history:
             st.write(f"**Q:** {entry['question']}\n**A:** {entry['answer']}\n")
-
-
-
-    else:
-        st.write("Upload documents to begin.")
 
 if __name__ == "__main__":
     main()
